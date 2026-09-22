@@ -382,19 +382,23 @@ public class MessageQueue implements AutoCloseable {
         if (lease != null) {
             return lease;
         }
-        // 本进程曾交付过？
+        // 是否属于其他消费组（优先于失效判断，保证跨组原因可区分）？
+        for (String other : store.listGroups()) {
+            if (!other.equals(group)) {
+                InFlightLease foreign = store.findLease(other, deliveryId);
+                if (foreign != null) {
+                    throw new CrossGroupCommitException(String.format(
+                            "跨消费组提交被拒绝: deliveryId=%s ownerGroup=%s submittedGroup=%s",
+                            deliveryId, other, group));
+                }
+            }
+        }
+        // 本组曾交付过但已被重投取代 / 本组 superseded 索引命中？
         InFlightLease seen = activeDeliveries.get(deliveryId);
-        if (seen != null || store.isSuperseded(group, deliveryId)) {
+        boolean inThisGroup = seen == null || group.equals(seen.group());
+        if ((seen != null && inThisGroup) || store.isSuperseded(group, deliveryId)) {
             throw new LeaseExpiredException(String.format(
                     "租约已失效（消息已重新投递）: group=%s deliveryId=%s", group, deliveryId));
-        }
-        // 是否属于其他消费组？
-        for (String other : store.listGroups()) {
-            if (!other.equals(group) && store.findLease(other, deliveryId) != null) {
-                throw new CrossGroupCommitException(String.format(
-                        "跨消费组提交被拒绝: deliveryId=%s ownerGroup=%s submittedGroup=%s",
-                        deliveryId, other, group));
-            }
         }
         throw new DuplicateAckException(String.format(
                 "重复确认被拒绝: group=%s deliveryId=%s (位点已提交或交付不存在)", group, deliveryId));
