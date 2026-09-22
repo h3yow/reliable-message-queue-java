@@ -57,6 +57,8 @@ public class PersistentStore {
     private final ConcurrentHashMap<String, Long> offsetCache = new ConcurrentHashMap<>();
     /** key = group，value: deliveryId -> 最新租约状态（null 值表示已删除） */
     private final ConcurrentHashMap<String, Map<String, InFlightLease>> leaseCache = new ConcurrentHashMap<>();
+    /** key = group，value: 已被取代的旧 deliveryId -> 新 deliveryId（重启后仍可区分租约过期） */
+    private final ConcurrentHashMap<String, Map<String, String>> supersededCache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, List<DlqRecord>> dlqCache = new ConcurrentHashMap<>();
 
     /** 幂等索引记录。 */
@@ -267,11 +269,28 @@ public class PersistentStore {
 
     public void removeLease(String group, String deliveryId) {
         synchronized (lockOf("leases#" + group)) {
-            Map<String, Object> tombstone = new LinkedHashMap<>();
-            tombstone.put("deleted", deliveryId);
+            Map<String, Object> tombstone = Map.of("deleted", deliveryId);
             appendLine(leasesFile(group), tombstone);
             leaseMap(group).remove(deliveryId);
         }
+    }
+
+    /**
+     * 记录旧交付被新交付取代（超时重投后，旧 deliveryId 失效）。
+     */
+    public void saveSupersededDelivery(String group, String oldDeliveryId, String newDeliveryId) {
+        synchronized (lockOf("leases#" + group)) {
+            Map<String, String> map = supersededMap(group);
+            if (!map.containsKey(oldDeliveryId)) {
+                appendLine(leasesFile(group),
+                        Map.of("superseded", oldDeliveryId, "by", newDeliveryId));
+                map.put(oldDeliveryId, newDeliveryId);
+            }
+        }
+    }
+
+    public boolean isSuperseded(String group, String deliveryId) {
+        return supersededMap(group).containsKey(deliveryId);
     }
 
     public List<String> listGroups() {
@@ -290,6 +309,7 @@ public class PersistentStore {
     private Map<String, InFlightLease> leaseMap(String group) {
         return leaseCache.computeIfAbsent(group, g -> {
             Map<String, InFlightLease> map = new LinkedHashMap<>();
+            Map<String, String> superseded = supersededMap(g);
             Path path = leasesFile(g);
             if (Files.exists(path)) {
                 for (String line : readLines(path)) {
@@ -297,6 +317,8 @@ public class PersistentStore {
                     });
                     if (row.containsKey("deleted")) {
                         map.remove((String) row.get("deleted"));
+                    } else if (row.containsKey("superseded")) {
+                        superseded.put((String) row.get("superseded"), (String) row.get("by"));
                     } else {
                         InFlightLease lease = mapper.convertValue(row, InFlightLease.class);
                         map.put(lease.deliveryId(), lease);
@@ -305,6 +327,11 @@ public class PersistentStore {
             }
             return Collections.synchronizedMap(map);
         });
+    }
+
+    private Map<String, String> supersededMap(String group) {
+        return supersededCache.computeIfAbsent(group,
+                g -> Collections.synchronizedMap(new LinkedHashMap<>()));
     }
 
     // ==================== dead letters ====================
