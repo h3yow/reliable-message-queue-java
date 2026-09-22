@@ -51,17 +51,24 @@ class ConcurrencyTest {
         try (MessageQueue q = new MessageQueue(props, new PersistentStore(tmp.toString()))) {
             q.createTopic("orders", 4, totalUnique * 2L, 4096);
 
+            // 生产任务总数：唯一消息生产者 + 幂等竞争写者
+            CountDownLatch producersFinished = new CountDownLatch(producerCount + duplicateWriters);
+
             // ---- 唯一消息生产者 ----
             for (int p = 0; p < producerCount; p++) {
                 int producerId = p;
                 pool.submit(() -> {
                     await(start);
-                    for (int i = 0; i < perProducer; i++) {
-                        String key = "key-" + (i % 20);
-                        String idem = "producer-" + producerId + "-msg-" + i;
-                        PublishReceipt r = q.publish("orders", key, idem,
-                                ("payload-" + producerId + "-" + i).getBytes());
-                        acceptedIds.add(r.messageId());
+                    try {
+                        for (int i = 0; i < perProducer; i++) {
+                            String key = "key-" + (i % 20);
+                            String idem = "producer-" + producerId + "-msg-" + i;
+                            PublishReceipt r = q.publish("orders", key, idem,
+                                    ("payload-" + producerId + "-" + i).getBytes());
+                            acceptedIds.add(r.messageId());
+                        }
+                    } finally {
+                        producersFinished.countDown();
                     }
                 });
             }
@@ -71,14 +78,18 @@ class ConcurrencyTest {
                 int writerId = w;
                 pool.submit(() -> {
                     await(start);
-                    for (int i = 0; i < 100; i++) {
-                        try {
-                            PublishReceipt r = q.publish("orders", "dup-key-" + i,
-                                    "shared-idem-" + i, ("dup-" + writerId + "-" + i).getBytes());
-                            acceptedIds.add(r.messageId());
-                        } catch (DuplicateMessageException e) {
-                            duplicateRejections.incrementAndGet();
+                    try {
+                        for (int i = 0; i < 100; i++) {
+                            try {
+                                PublishReceipt r = q.publish("orders", "dup-key-" + i,
+                                        "shared-idem-" + i, ("dup-" + writerId + "-" + i).getBytes());
+                                acceptedIds.add(r.messageId());
+                            } catch (DuplicateMessageException e) {
+                                duplicateRejections.incrementAndGet();
+                            }
                         }
+                    } finally {
+                        producersFinished.countDown();
                     }
                 });
             }
@@ -95,7 +106,9 @@ class ConcurrencyTest {
                 pool.submit(() -> {
                     await(start);
                     int idleRounds = 0;
-                    while (idleRounds < 50) {
+                    // 只有在「生产者已全部结束」之后，连续空轮询才允许退出，
+                    // 避免生产较慢时消费者提前终止而漏消费。
+                    while (idleRounds < 100) {
                         Optional<Delivery> d = q.poll("grp-shared", "orders");
                         if (d.isEmpty()) {
                             idleRounds++;
@@ -120,6 +133,8 @@ class ConcurrencyTest {
             }
 
             start.countDown();
+            // 等待全部生产完成，给消费者一个明确的停机闸
+            assertTrue(producersFinished.await(60, TimeUnit.SECONDS), "生产者必须在超时前结束");
             pool.shutdown();
             assertTrue(pool.awaitTermination(60, TimeUnit.SECONDS), "并发任务必须在超时前结束");
 
