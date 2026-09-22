@@ -386,6 +386,7 @@ public class PersistentStore {
             List<DlqRecord> list = Collections.synchronizedList(new ArrayList<>());
             Path path = dlqFile(g);
             if (Files.exists(path)) {
+                List<DeadLetterEntry> entries = new ArrayList<>();
                 java.util.Set<String> replayed = new java.util.HashSet<>();
                 for (String line : readLines(path)) {
                     Map<String, Object> row = readValue(line, new TypeReference<Map<String, Object>>() {
@@ -393,9 +394,12 @@ public class PersistentStore {
                     if (row.containsKey("replayed")) {
                         replayed.add((String) row.get("replayed"));
                     } else {
-                        DeadLetterEntry entry = mapper.convertValue(row, DeadLetterEntry.class);
-                        list.add(new DlqRecord(entry, replayed.contains(entry.deadLetterId())));
+                        entries.add(mapper.convertValue(row, DeadLetterEntry.class));
                     }
+                }
+                // 两趟：先收齐所有重放标记，再判定每个条目的状态（标记可能晚于条目出现）
+                for (DeadLetterEntry entry : entries) {
+                    list.add(new DlqRecord(entry, replayed.contains(entry.deadLetterId())));
                 }
             }
             return list;

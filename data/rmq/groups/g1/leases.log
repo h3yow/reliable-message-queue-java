@@ -1,4 +1,0 @@
-{"deliveryId":"3e5265c5-38a8-49b8-a97c-a09622692167","group":"g1","topic":"http-orders","partition":0,"offset":0,"attempt":1,"leasedAt":1790077812324,"leasedUntil":1790077842324,"backoffUntil":0,"lastError":null}
-{"deleted":"3e5265c5-38a8-49b8-a97c-a09622692167"}
-{"deliveryId":"3a9fb0a9-f1da-4e79-9007-b7ee0076d9b2","group":"g1","topic":"http-orders","partition":0,"offset":1,"attempt":1,"leasedAt":1790077812358,"leasedUntil":1790077842358,"backoffUntil":0,"lastError":null}
-{"deliveryId":"3a9fb0a9-f1da-4e79-9007-b7ee0076d9b2","group":"g1","topic":"http-orders","partition":0,"offset":1,"attempt":1,"leasedAt":1790077812358,"leasedUntil":1790077812373,"backoffUntil":1790077812573,"lastError":"boom-1"}

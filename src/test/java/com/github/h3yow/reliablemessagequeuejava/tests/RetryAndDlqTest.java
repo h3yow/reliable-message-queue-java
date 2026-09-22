@@ -153,4 +153,35 @@ class RetryAndDlqTest {
             assertEquals(0, q.deadLetters("grp-a", "orders").size());
         }
     }
+
+    @Test
+    void replayedDeadLetterStaysHiddenAfterRestart() {
+        AtomicLong now = new AtomicLong(4_000_000L);
+        QueueProperties props = fastBackoffProps(tmp);
+        String dlqId;
+        try (MessageQueue q = new MessageQueue(props,
+                new com.github.h3yow.reliablemessagequeuejava.storage.PersistentStore(tmp.toString()),
+                now::get)) {
+            q.createTopic("rt", 1, 1000, 1024);
+            q.publish("rt", "k", "idem-1", "x".getBytes());
+            Delivery d = q.poll("grp-a", "rt").orElseThrow();
+            q.nack("grp-a", d.deliveryId(), "e1");
+            now.addAndGet(50);
+            d = q.poll("grp-a", "rt").orElseThrow();
+            q.nack("grp-a", d.deliveryId(), "e2");
+            now.addAndGet(50);
+            d = q.poll("grp-a", "rt").orElseThrow();
+            q.nack("grp-a", d.deliveryId(), "e3");
+            dlqId = q.deadLetters("grp-a", "rt").get(0).deadLetterId();
+            q.replayDeadLetter("grp-a", dlqId);
+            assertEquals(0, q.deadLetters("grp-a", "rt").size());
+        }
+        // 重启（新 store / 新队列重放日志）
+        try (MessageQueue reopened = new MessageQueue(props,
+                new com.github.h3yow.reliablemessagequeuejava.storage.PersistentStore(tmp.toString()),
+                now::get)) {
+            assertEquals(0, reopened.deadLetters("grp-a", "rt").size(),
+                    "已重放死信在应用重启后仍不得再次列出");
+        }
+    }
 }

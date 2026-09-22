@@ -1,2 +1,0 @@
-{"id":"6673849a-5bd0-4c69-a981-44fd1581b093","topic":"http-orders","partitionKey":"k1","idempotencyKey":"idem-1","payload":"aGVsbG8=","partition":0,"seq":0,"publishedAt":1790077812268}
-{"id":"3d9dbe3a-0dcb-47f5-a8e2-e9c7dc70dea2","topic":"http-orders","partitionKey":"k1","idempotencyKey":"idem-2","payload":"d29ybGQ=","partition":0,"seq":1,"publishedAt":1790077812302}
