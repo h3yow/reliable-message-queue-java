@@ -207,7 +207,10 @@ public class MessageQueue implements AutoCloseable {
                         existing == null ? null : existing.lastError());
                 store.saveLease(lease);
                 if (existing != null) {
+                    // 旧交付被新交付取代：逻辑删除旧租约，保证每个（组,分区）至多一条活动租约
+                    store.removeLease(group, existing.deliveryId());
                     store.saveSupersededDelivery(group, existing.deliveryId(), deliveryId);
+                    activeDeliveries.remove(existing.deliveryId());
                 }
                 activeDeliveries.put(deliveryId, lease);
                 log.info("deliver topic={} key={} seq={} partition={} group={} deliveryId={} attempt={} offset={} committed={}",
@@ -272,8 +275,9 @@ public class MessageQueue implements AutoCloseable {
         }
 
         long backoff = backoffMillis(attempt);
+        // nack 后本次交付立即失效（leasedUntil=now），是否可再次交付仅由退避时刻决定
         InFlightLease updated = new InFlightLease(deliveryId, group, lease.topic(), lease.partition(),
-                lease.offset(), attempt, lease.leasedAt(), lease.leasedUntil(),
+                lease.offset(), attempt, lease.leasedAt(), now,
                 now + backoff, error);
         store.saveLease(updated);
         activeDeliveries.put(deliveryId, updated);
