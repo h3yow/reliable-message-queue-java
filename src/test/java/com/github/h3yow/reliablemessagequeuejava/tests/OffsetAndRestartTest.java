@@ -142,18 +142,30 @@ class OffsetAndRestartTest {
 
     @Test
     void offsetRegressionRejectedWhenCommittingOutOfOrder() {
-        // 窗口为 1 时无法从正常 poll 拿到跳跃位点；用两个消费组在同一分区制造不同位点，
-        // 再验证 ack 对"前序未确认"的守卫仍然单调（防止实现退化）。
         QueueProperties props = TestQueues.properties(tmp, Duration.ofSeconds(60),
                 5, Duration.ofMillis(10), Duration.ofSeconds(1));
         try (MessageQueue q = new MessageQueue(props, new PersistentStore(tmp.toString()))) {
             q.createTopic("t", 1, 1000, 1024);
-            q.publish("t", "k", null, "m".getBytes());
-            Delivery d = q.poll("grp-a", "t").orElseThrow();
-            assertEquals(0, d.offset());
-            assertEquals(-1L, q.committedOffset("grp-a", "t", 0));
-            q.ack("grp-a", d.deliveryId());
+            q.publish("t", "k", "idem-0", "m0".getBytes());
+            q.publish("t", "k", "idem-1", "m1".getBytes());
+
+            // 初始位点 -1，提交 0 成功
+            q.commitOffset("grp-a", "t", 0, 0L);
             assertEquals(0L, q.committedOffset("grp-a", "t", 0));
+
+            // 回退到 -1（或 0）必须拒绝
+            assertThrows(OffsetRegressionException.class,
+                    () -> q.commitOffset("grp-a", "t", 0, -1L));
+            assertThrows(OffsetRegressionException.class,
+                    () -> q.commitOffset("grp-a", "t", 0, 0L));
+
+            // 跳跃到不存在的位点也拒绝
+            assertThrows(OffsetRegressionException.class,
+                    () -> q.commitOffset("grp-a", "t", 0, 5L));
+
+            // 合法前进
+            q.commitOffset("grp-a", "t", 0, 1L);
+            assertEquals(1L, q.committedOffset("grp-a", "t", 0));
         }
     }
 }

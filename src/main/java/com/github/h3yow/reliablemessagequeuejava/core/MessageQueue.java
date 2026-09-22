@@ -305,6 +305,33 @@ public class MessageQueue implements AutoCloseable {
         return store.loadCommittedOffset(group, topic, partition);
     }
 
+    /**
+     * 显式提交位点（管理型接口，不依赖具体交付）。
+     * 只允许提交为"已存在的消息序号"且严格大于当前位点，回退与跳跃都以
+     * {@link OffsetRegressionException} 拒绝。
+     */
+    public void commitOffset(String group, String topic, int partition, long offset) {
+        validateGroupName(group);
+        TopicConfig config = requireTopic(topic);
+        if (partition < 0 || partition >= config.partitionCount()) {
+            throw new InvalidTopicException("分区越界: " + partition);
+        }
+        long current = store.loadCommittedOffset(group, topic, partition);
+        if (offset <= current) {
+            throw new OffsetRegressionException(String.format(
+                    "位点回退被拒绝: group=%s topic=%s partition=%d current=%d submitted=%d",
+                    group, topic, partition, current, offset));
+        }
+        if (store.readMessageAt(topic, partition, offset) == null) {
+            throw new OffsetRegressionException(String.format(
+                    "位点跳跃被拒绝: group=%s topic=%s partition=%d current=%d submitted=%d (目标消息不存在)",
+                    group, topic, partition, current, offset));
+        }
+        store.commitOffset(group, topic, partition, offset);
+        log.info("commit group={} topic={} partition={} current={} offset={}",
+                group, topic, partition, current, offset);
+    }
+
     public List<DeadLetterEntry> deadLetters(String group, String topic) {
         return store.loadDeadLetters(group, topic);
     }

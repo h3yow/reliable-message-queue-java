@@ -1,0 +1,7 @@
+{
+  "name" : "http-orders",
+  "partitionCount" : 1,
+  "capacity" : 100,
+  "maxPayloadBytes" : 10,
+  "retention" : 0.0
+}
