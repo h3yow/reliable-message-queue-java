@@ -184,4 +184,33 @@ class RetryAndDlqTest {
                     "已重放死信在应用重启后仍不得再次列出");
         }
     }
+
+    @Test
+    void replayFailsClearlyWhenTopicFullAndDeadLetterStaysQueryable() {
+        AtomicLong now = new AtomicLong(5_000_000L);
+        QueueProperties props = TestQueues.properties(tmp, Duration.ofSeconds(60), 3,
+                Duration.ofMillis(10), Duration.ofMillis(40));
+        try (MessageQueue q = new MessageQueue(props,
+                new com.github.h3yow.reliablemessagequeuejava.storage.PersistentStore(tmp.toString()),
+                now::get)) {
+            // 容量 1：唯一一条消息消费失败 3 次后进死信（位点推进），主题已满
+            q.createTopic("full", 1, 1, 1024);
+            q.publish("full", "k", "idem-1", "x".getBytes());
+            Delivery d = q.poll("grp-a", "full").orElseThrow();
+            q.nack("grp-a", d.deliveryId(), "e1");
+            now.addAndGet(50);
+            d = q.poll("grp-a", "full").orElseThrow();
+            q.nack("grp-a", d.deliveryId(), "e2");
+            now.addAndGet(50);
+            d = q.poll("grp-a", "full").orElseThrow();
+            q.nack("grp-a", d.deliveryId(), "e3");
+
+            String dlqId = q.deadLetters("grp-a", "full").get(0).deadLetterId();
+            // 重放需要追加新消息，但容量已满 -> 明确拒绝，且不把死信标记成已重放
+            assertThrows(com.github.h3yow.reliablemessagequeuejava.exception.TopicCapacityExceededException.class,
+                    () -> q.replayDeadLetter("grp-a", dlqId));
+            assertEquals(1, q.deadLetters("grp-a", "full").size(),
+                    "重放失败不得吞掉死信，仍可查询并稍后重放");
+        }
+    }
 }

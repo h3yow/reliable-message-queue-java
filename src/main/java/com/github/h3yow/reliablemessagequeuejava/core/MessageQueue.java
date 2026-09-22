@@ -361,11 +361,19 @@ public class MessageQueue implements AutoCloseable {
                     r.partition(), r.offset());
         } else {
             Message origin = entry.message();
-            receipt = publish(origin.topic(), origin.partitionKey(), deterministicKey, origin.payload());
+            try {
+                receipt = publish(origin.topic(), origin.partitionKey(), deterministicKey, origin.payload());
+            } catch (TopicCapacityExceededException e) {
+                throw new TopicCapacityExceededException(
+                        "死信重放失败（主题容量已满，请先扩容或清理）: dlqId=" + deadLetterId, e);
+            }
             log.info("dlq replay group={} dlqId={} topic={} newSeq={}",
                     group, deadLetterId, origin.topic(), receipt.offset());
         }
-        store.markDeadLetterReplayed(group, deadLetterId);
+        if (!store.markDeadLetterReplayed(group, deadLetterId)) {
+            // 极端并发：另一线程已重放。因幂等键确定，返回的仍是同一条消息，无副作用
+            log.debug("dlq entry already marked replayed: group={} dlqId={}", group, deadLetterId);
+        }
         return receipt;
     }
 
