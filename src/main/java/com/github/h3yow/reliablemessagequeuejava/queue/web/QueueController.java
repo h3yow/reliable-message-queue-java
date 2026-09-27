@@ -1,8 +1,11 @@
 package com.github.h3yow.reliablemessagequeuejava.queue.web;
 
 import com.github.h3yow.reliablemessagequeuejava.queue.ReliableMessageQueue;
+import com.github.h3yow.reliablemessagequeuejava.queue.model.BatchReplayResult;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.DeadLetter;
+import com.github.h3yow.reliablemessagequeuejava.queue.model.DeadLetterFilter;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.Delivery;
+import com.github.h3yow.reliablemessagequeuejava.queue.model.PartitionBlocker;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.PublishResult;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.ReplayResult;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.TopicConfig;
@@ -127,6 +130,28 @@ public class QueueController {
         return queue.replayDeadLetter(deadLetterId, group);
     }
 
+    @PostMapping("/topics/{topic}/deadletters/replay-batch")
+    public BatchReplayResult replayBatch(@PathVariable String topic,
+                                         @RequestParam(required = false) String group,
+                                         @RequestParam(required = false) Integer partition,
+                                         @RequestParam(required = false) Long deadAtFrom,
+                                         @RequestParam(required = false) Long deadAtTo,
+                                         @RequestBody(required = false) Map<String, Object> body) {
+        // 查询参数优先，缺省时回退到 JSON body，方便 curl 与程序化调用。
+        String g = group != null ? group : bodyString(body, "group");
+        Integer p = partition != null ? partition : bodyInt(body, "partition");
+        Long from = deadAtFrom != null ? deadAtFrom : bodyLong(body, "deadAtFrom");
+        Long to = deadAtTo != null ? deadAtTo : bodyLong(body, "deadAtTo");
+        return queue.replayDeadLetters(new DeadLetterFilter(topic, g, p, from, to));
+    }
+
+    @GetMapping("/topics/{topic}/partitions/{partition}/blocker")
+    public PartitionBlocker partitionBlocker(@PathVariable String topic,
+                                             @PathVariable int partition,
+                                             @RequestParam String group) {
+        return queue.getPartitionBlocker(group, topic, partition);
+    }
+
     private static Delivery toDelivery(String topic, String group, Map<String, Object> body) {
         return new Delivery(topic, group,
                 intValue(body.get("partition"), 0),
@@ -145,5 +170,26 @@ public class QueueController {
 
     private static long longValue(Object o, long def) {
         return o == null ? def : Long.parseLong(String.valueOf(o));
+    }
+
+    private static String bodyString(Map<String, Object> body, String key) {
+        if (body == null || body.get(key) == null) {
+            return null;
+        }
+        return String.valueOf(body.get(key));
+    }
+
+    private static Integer bodyInt(Map<String, Object> body, String key) {
+        if (body == null || body.get(key) == null) {
+            return null;
+        }
+        return Integer.valueOf(String.valueOf(body.get(key)));
+    }
+
+    private static Long bodyLong(Map<String, Object> body, String key) {
+        if (body == null || body.get(key) == null) {
+            return null;
+        }
+        return Long.valueOf(String.valueOf(body.get(key)));
     }
 }
