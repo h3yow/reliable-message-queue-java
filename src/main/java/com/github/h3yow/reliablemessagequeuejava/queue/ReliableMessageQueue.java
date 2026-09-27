@@ -1,6 +1,7 @@
 package com.github.h3yow.reliablemessagequeuejava.queue;
 
 import com.github.h3yow.reliablemessagequeuejava.queue.exception.DuplicateAckException;
+import com.github.h3yow.reliablemessagequeuejava.queue.exception.BatchReplayRejectedException;
 import com.github.h3yow.reliablemessagequeuejava.queue.exception.DuplicateIdempotencyKeyException;
 import com.github.h3yow.reliablemessagequeuejava.queue.exception.InvalidTopicException;
 import com.github.h3yow.reliablemessagequeuejava.queue.exception.OffsetRollbackException;
@@ -9,8 +10,12 @@ import com.github.h3yow.reliablemessagequeuejava.queue.exception.QueueException;
 import com.github.h3yow.reliablemessagequeuejava.queue.exception.TopicCapacityExceededException;
 import com.github.h3yow.reliablemessagequeuejava.queue.exception.TopicNotFoundException;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.DeadLetter;
+import com.github.h3yow.reliablemessagequeuejava.queue.model.DeadLetterFilter;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.Delivery;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.PublishResult;
+import com.github.h3yow.reliablemessagequeuejava.queue.model.BatchReplayResult;
+import com.github.h3yow.reliablemessagequeuejava.queue.model.PartitionBlockerView;
+import com.github.h3yow.reliablemessagequeuejava.queue.model.PartitionBlocker;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.ReplayResult;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.StoredMessage;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.TopicConfig;
@@ -250,20 +255,12 @@ public class ReliableMessageQueue implements AutoCloseable {
         for (int i = 0; i < config.partitionCount() && deliveries.size() < limit; i++) {
             int partition = (start + i) % config.partitionCount();
             long committed = gs.committedOffsets.getOrDefault(partition, -1L);
+            // 分区内严格按位点升序，且队头阻塞：从已提交位点的下一条开始按顺序检查，只投递“连续可见”
+            // 的前缀；遇到任何一条当前不可投递的未解决消息（在途租约、退避中）就停止该分区，
+            // 绝不跨过它投递后面的消息（其他分区不受影响）。
             List<StoredMessage> candidates = new ArrayList<>();
             for (StoredMessage m : state.messages) {
                 if (m.partition() != partition || !m.topic().equals(topic) || m.offset() <= committed) {
-                    continue;
-                }
-                String key = m.id();
-                if (gs.resolvedKeys.contains(key) || gs.leasesByKey.containsKey(key)) {
-                    continue;
-                }
-                if (isDead(gs, key)) {
-                    continue;
-                }
-                NackState ns = gs.nackByKey.get(key);
-                if (ns != null && ns.nextVisibleAt > now) {
                     continue;
                 }
                 candidates.add(m);
@@ -273,7 +270,20 @@ public class ReliableMessageQueue implements AutoCloseable {
                 if (deliveries.size() >= limit) {
                     break;
                 }
-                NackState ns = gs.nackByKey.get(m.id());
+                String key = m.id();
+                if (gs.resolvedKeys.contains(key) || isDead(gs, key)) {
+                    // 已解决但位点未推进（理论上 advanceCommitted 已处理），继续检查下一条。
+                    continue;
+                }
+                if (gs.leasesByKey.containsKey(key)) {
+                    // 队头仍在途：它未解决，后面的消息必须等它，停止本分区。
+                    break;
+                }
+                NackState ns = gs.nackByKey.get(key);
+                if (ns != null && ns.nextVisibleAt > now) {
+                    // 队头处于退避等待：阻塞同分区后续消息，停止本分区。
+                    break;
+                }
                 int attempt = ns == null ? 1 : ns.attempts + 1;
                 Lease lease = new Lease();
                 lease.token = UUID.randomUUID().toString();
@@ -485,6 +495,199 @@ public class ReliableMessageQueue implements AutoCloseable {
                 deadLetterId, target.topic(), target.partitionKey(), target.originalOffset(),
                 pr.seq(), pr.offset(), target.group());
         return new ReplayResult(updated, pr);
+    }
+
+    // ---------------- 批量重放 ----------------
+
+    /**
+     * 按条件筛选一批死信并整体重放（原子：要么全部重新进入投递流程，要么一条都不生效）。
+     *
+     * <p>语义：
+     * <ul>
+     *   <li>按 {@link DeadLetterFilter}（topic 必填，可再按 group/分区/进入死信时间范围筛选）挑出死信；</li>
+     *   <li>命中的死信中只要有一条当前进不去（已被重放、容量不足、幂等键冲突等），<b>整批原样拒绝</b>，
+     *       不新增消息、不改死信记录、不落盘、不影响已有进度与后续重试；</li>
+     *   <li>整批通过校验后才一次性追加为多条新消息（各自新 id/位点/序号），按死信进入死信前在分区内的
+     *       先后顺序（分区、原位点升序）分配位点，保证同分区顺序确定、可复现；</li>
+     *   <li>被拒绝后用相同条件原样再次提交，在容量腾出/问题消除后能够成功，不会留下“再也重放不了”的状态。</li>
+     * </ul>
+     */
+    public synchronized BatchReplayResult replayDeadLetters(DeadLetterFilter filter) {
+        if (filter == null || filter.topic() == null) {
+            throw new InvalidTopicException("批量重放必须指定主题");
+        }
+        TopicConfig config = requireTopic(filter.topic());
+        if (filter.partition() != null
+                && (filter.partition() < 0 || filter.partition() >= config.partitionCount())) {
+            throw new InvalidTopicException(
+                    "分区越界: topic=" + filter.topic() + " partition=" + filter.partition()
+                            + " partitionCount=" + config.partitionCount());
+        }
+        if (filter.deadAfter() != null && filter.deadBefore() != null
+                && filter.deadAfter() > filter.deadBefore()) {
+            throw new InvalidTopicException("进入死信时间范围非法: deadAfter > deadBefore");
+        }
+
+        // 1) 筛选（不含任何状态修改）。
+        List<DeadLetter> selected = new ArrayList<>();
+        for (DeadLetter d : state.deadLetters) {
+            if (filter.matches(d)) {
+                selected.add(d);
+            }
+        }
+        if (selected.isEmpty()) {
+            return new BatchReplayResult(0, 0, List.of());
+        }
+
+        // 2) 整批预检：任何一条不满足，直接抛异常，此前没有任何改动，也没有落盘。
+        java.util.Set<String> topicIdemKeys = state.idempotencyKeys.get(filter.topic());
+        for (DeadLetter d : selected) {
+            if (d.replayed()) {
+                throw new BatchReplayRejectedException(
+                        "批次中存在已重放的死信，整批拒绝: dlqId=" + d.deadLetterId()
+                                + " topic=" + d.topic() + " replayedToOffset=" + d.replayedToOffset());
+            }
+            String replayKey = "replay:" + d.deadLetterId();
+            if (topicIdemKeys != null && topicIdemKeys.contains(replayKey)) {
+                throw new BatchReplayRejectedException(
+                        "批次中存在重放幂等键冲突，整批拒绝: dlqId=" + d.deadLetterId());
+            }
+        }
+        // 重放产生的每条新消息都尚未被任何消费组解决，因此都占用主题容量。
+        int pending = countPendingMessages(filter.topic());
+        if (pending + selected.size() > config.capacity()) {
+            throw new BatchReplayRejectedException(
+                    "批量重放会超过主题容量，整批拒绝: topic=" + filter.topic()
+                            + " capacity=" + config.capacity() + " pending=" + pending
+                            + " batchSize=" + selected.size());
+        }
+
+        // 3) 确定可复现的写入顺序：先按分区、再按进入死信前的原位点（同分区严格升序），
+        //    最后用死信 id 兜底，保证同样的筛选条件多次提交结果先后一致。
+        selected.sort(Comparator
+                .comparingInt(DeadLetter::partition)
+                .thenComparingLong(DeadLetter::originalOffset)
+                .thenComparing(DeadLetter::deadAt)
+                .thenComparing(DeadLetter::deadLetterId));
+
+        // 4) 一次性完成全部内存变更，最后只落盘一次。
+        List<ReplayResult> results = new ArrayList<>(selected.size());
+        long now = System.currentTimeMillis();
+        long[] meta = state.partitionMeta.get(filter.topic());
+        for (DeadLetter target : selected) {
+            int partition = target.partition();
+            long newOffset = meta[partition]++;
+            long newSeq = state.topicSequences.merge(filter.topic(), 1L, Long::sum) - 1;
+            StoredMessage msg = new StoredMessage(
+                    UUID.randomUUID().toString(), filter.topic(), partition, newOffset, newSeq,
+                    target.partitionKey(), "replay:" + target.deadLetterId(), target.payload(),
+                    now, target.deadLetterId());
+            state.messages.add(msg);
+            topicIdemKeys.add("replay:" + target.deadLetterId());
+
+            PublishResult pr = new PublishResult(msg.id(), partition, newOffset, newSeq, false);
+            DeadLetter updated = new DeadLetter(target.deadLetterId(), target.group(), target.topic(),
+                    target.partition(), target.originalOffset(), target.seq(), target.partitionKey(),
+                    target.originalMessageId(), target.payload(), target.attempts(), target.lastError(),
+                    target.deadAt(), true, newOffset, msg.id());
+            replaceDeadLetter(target.deadLetterId(), updated);
+            results.add(new ReplayResult(updated, pr));
+        }
+        persist();
+        log.info("批量重放死信成功 topic={} group={} partition={} count={}",
+                filter.topic(), filter.group(), filter.partition(), results.size());
+        return new BatchReplayResult(results.size(), results.size(), List.copyOf(results));
+    }
+
+    private void replaceDeadLetter(String deadLetterId, DeadLetter updated) {
+        for (int i = 0; i < state.deadLetters.size(); i++) {
+            if (state.deadLetters.get(i).deadLetterId().equals(deadLetterId)) {
+                state.deadLetters.set(i, updated);
+                return;
+            }
+        }
+        state.deadLetters.add(updated);
+    }
+
+    // ---------------- 分区卡点查询 ----------------
+
+    /**
+     * 查询某主题某分区当前卡在最前面的未解决消息（按消费组列出）。
+     *
+     * <p>“卡点”即该消费组在该分区已提交位点之后的<em>第一条未解决</em>消息——它不解决，
+     * 同分区排在它后面的消息就不能被跨过去投递。无论它此刻是等待退避、租约未确认、
+     * 租约已超时未确认，还是应用刚重启尚未重新投递，都会被如实反映（该接口只读，不触发回收）。
+     * 没有任何消费组在该分区有未解决队头消息时返回 {@code blocked=false}。
+     */
+    public synchronized PartitionBlockerView getPartitionBlocker(String topic, int partition) {
+        TopicConfig config = requireTopic(topic);
+        if (partition < 0 || partition >= config.partitionCount()) {
+            throw new InvalidTopicException(
+                    "分区越界: topic=" + topic + " partition=" + partition
+                            + " partitionCount=" + config.partitionCount());
+        }
+        long now = System.currentTimeMillis();
+        List<PartitionBlocker> blockers = new ArrayList<>();
+        // 按消费组名排序，保证多次查询输出稳定、可复现。
+        List<GroupState> groupStates = new ArrayList<>();
+        for (GroupState gs : state.groups.values()) {
+            if (gs.topic.equals(topic)) {
+                groupStates.add(gs);
+            }
+        }
+        groupStates.sort(Comparator.comparing(g -> g.group));
+        for (GroupState gs : groupStates) {
+            long committed = gs.committedOffsets.getOrDefault(partition, -1L);
+            // 找到该分区已提交位点之后第一条未解决的消息（位点最小者即队头）。
+            StoredMessage head = null;
+            for (StoredMessage m : state.messages) {
+                if (!m.topic().equals(topic) || m.partition() != partition
+                        || m.offset() <= committed) {
+                    continue;
+                }
+                if (gs.resolvedKeys.contains(m.id()) || isDead(gs, m.id())) {
+                    continue;
+                }
+                if (head == null || m.offset() < head.offset()) {
+                    head = m;
+                }
+            }
+            if (head == null) {
+                continue;
+            }
+            Lease lease = gs.leasesByKey.get(head.id());
+            NackState ns = gs.nackByKey.get(head.id());
+            String blockerState;
+            long nextDeliverAt;
+            Long leaseExpiresAt = null;
+            if (lease != null) {
+                // 在途租约：未到期要等租约；已超时则下次 poll 立即可重投。
+                if (lease.expiresAt > now) {
+                    blockerState = PartitionBlocker.LEASED;
+                    nextDeliverAt = lease.expiresAt;
+                } else {
+                    blockerState = PartitionBlocker.LEASE_EXPIRED;
+                    nextDeliverAt = now;
+                }
+                leaseExpiresAt = lease.expiresAt;
+            } else if (ns != null && ns.nextVisibleAt > now) {
+                blockerState = PartitionBlocker.BACKOFF;
+                nextDeliverAt = ns.nextVisibleAt;
+            } else {
+                // 无租约、退避已结束或从未失败（含应用重启后旧租约被清空的情况）：立即投递。
+                blockerState = PartitionBlocker.DELIVERABLE;
+                nextDeliverAt = now;
+            }
+            blockers.add(new PartitionBlocker(
+                    gs.group, head.id(), partition, head.offset(), head.seq(),
+                    head.partitionKey(), ns == null ? 0 : ns.attempts,
+                    blockerState, nextDeliverAt, leaseExpiresAt,
+                    ns == null ? null : ns.lastError));
+        }
+        if (blockers.isEmpty()) {
+            return PartitionBlockerView.notBlocked(topic, partition);
+        }
+        return new PartitionBlockerView(topic, partition, true, List.copyOf(blockers));
     }
 
     // ---------------- 租约回收 ----------------

@@ -19,7 +19,8 @@ public class QueueExceptionHandler {
         HttpStatus status = switch (e.getCode()) {
             case "TOPIC_NOT_FOUND", "DEAD_LETTER_NOT_FOUND" -> HttpStatus.NOT_FOUND;
             case "DUPLICATE_IDEMPOTENCY_KEY", "TOPIC_CAPACITY_EXCEEDED",
-                 "OFFSET_ROLLBACK", "CROSS_GROUP_COMMIT", "DUPLICATE_ACK" -> HttpStatus.CONFLICT;
+                 "OFFSET_ROLLBACK", "CROSS_GROUP_COMMIT", "DUPLICATE_ACK",
+                 "BATCH_REPLAY_REJECTED" -> HttpStatus.CONFLICT;
             default -> HttpStatus.BAD_REQUEST;
         };
         return ResponseEntity.status(status).body(Map.of(

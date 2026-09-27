@@ -1,8 +1,11 @@
 package com.github.h3yow.reliablemessagequeuejava.queue.web;
 
 import com.github.h3yow.reliablemessagequeuejava.queue.ReliableMessageQueue;
+import com.github.h3yow.reliablemessagequeuejava.queue.model.BatchReplayResult;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.DeadLetter;
+import com.github.h3yow.reliablemessagequeuejava.queue.model.DeadLetterFilter;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.Delivery;
+import com.github.h3yow.reliablemessagequeuejava.queue.model.PartitionBlockerView;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.PublishResult;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.ReplayResult;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.TopicConfig;
@@ -125,6 +128,29 @@ public class QueueController {
     public ReplayResult replay(@PathVariable String deadLetterId,
                                @RequestParam(required = false) String group) {
         return queue.replayDeadLetter(deadLetterId, group);
+    }
+
+    /**
+     * 批量重放：按消费组/分区/进入死信时间范围筛选某个主题下的死信并整体重放。
+     * 整批原子，任何一条进不去都会 409 整批拒绝（BATCH_REPLAY_REJECTED），可原样重试。
+     */
+    @PostMapping("/topics/{topic}/deadletters/replay")
+    public BatchReplayResult replayBatch(@PathVariable String topic,
+                                         @RequestParam(required = false) String group,
+                                         @RequestParam(required = false) Integer partition,
+                                         @RequestParam(required = false) Long deadAfter,
+                                         @RequestParam(required = false) Long deadBefore) {
+        return queue.replayDeadLetters(
+                new DeadLetterFilter(topic, group, partition, deadAfter, deadBefore));
+    }
+
+    /**
+     * 分区卡点查询：返回该分区当前各消费组视角下挡住后续投递的队头消息；无卡点时 blocked=false。
+     */
+    @GetMapping("/topics/{topic}/partitions/{partition}/blocker")
+    public PartitionBlockerView partitionBlocker(@PathVariable String topic,
+                                                 @PathVariable int partition) {
+        return queue.getPartitionBlocker(topic, partition);
     }
 
     private static Delivery toDelivery(String topic, String group, Map<String, Object> body) {
