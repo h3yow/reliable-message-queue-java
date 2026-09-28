@@ -13,6 +13,7 @@ import com.github.h3yow.reliablemessagequeuejava.queue.model.DeadLetter;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.DeadLetterFilter;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.Delivery;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.PartitionBlocker;
+import com.github.h3yow.reliablemessagequeuejava.queue.model.PartitionBlockers;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.PublishResult;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.ReplayResult;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.StoredMessage;
@@ -492,12 +493,19 @@ public class ReliableMessageQueue implements AutoCloseable {
     }
 
     /**
-     * 批量重放死信：按筛选条件选出一批<em>未重放</em>死信，整体重新进入投递流程。
+     * 批量重放死信：按筛选条件选出一批死信，整体重新进入投递流程。
      *
-     * <p>原子语义：先在不改动任何状态的前提下完成全部预检（负载、重放幂等键、容量），
-     * 只要有一条此刻进不去，整批以 {@code BATCH_REPLAY_REJECTED} 原样拒绝，
-     * 不写盘、不占用容量、不改动死信记录，也不影响这些消息之外的任何重试；
-     * 问题处理完后用完全相同的筛选条件再次提交即可成功。
+     * <p>原子语义（整批要么全部生效、要么一条都不生效）：先在不改动任何状态的前提下完成
+     * 全部预检（负载、是否已重放、重放幂等键、容量），只要有一条此刻进不去，整批以
+     * {@code BATCH_REPLAY_REJECTED} 原样拒绝，不写盘、不占用容量、不改动死信记录、
+     * 不改变已确认进度与任何重试状态，也不影响这些消息之外的任何投递。
+     *
+     * <p>筛选范围内只要包含此前<em>已重放</em>过的死信（包括此前被单条重放的），整批即被
+     * 拒绝——不会跳过它继续处理其余条目；如只想重放其余条目，请缩小筛选条件后重新提交。
+     * 若筛选范围内没有任何死信，返回 {@code selected=0} 的空结果（属于无操作，不改变任何状态）。
+     *
+     * <p>可重试语义：被拒后把问题处理掉（例如把在途消息确认/消费掉以腾出容量），用
+     * <em>完全相同</em>的筛选条件再次提交即可整体成功。
      *
      * <p>顺序语义：同一分区内的多条重放按它们当初进死信前的原位点升序追加，
      * 因此被消费时保持原先后关系；选择与排序都是确定性的，相同条件重复提交结果一致。
@@ -520,10 +528,10 @@ public class ReliableMessageQueue implements AutoCloseable {
                     "死信时间范围非法: from=" + filter.deadAtFrom() + " > to=" + filter.deadAtTo());
         }
 
-        // 1) 选择未重放死信（已重放的不参与批次，保证同一筛选条件可安全重复提交）
+        // 1) 按筛选条件选出死信（不跳过已重放的：命中已重放记录将导致整批被拒绝）
         List<DeadLetter> selected = new ArrayList<>();
         for (DeadLetter d : state.deadLetters) {
-            if (!d.topic().equals(topic) || d.replayed()) {
+            if (!d.topic().equals(topic)) {
                 continue;
             }
             if (filter.group() != null && !filter.group().equals(d.group())) {
@@ -550,14 +558,23 @@ public class ReliableMessageQueue implements AutoCloseable {
             return new BatchReplayResult(topic, 0, List.of());
         }
 
-        // 3) 预检阶段：不改动任何状态
-        for (DeadLetter d : selected) {
-            validateReplayPayload(config, d);
-        }
+        // 3) 预检阶段：不改动任何状态。任何一条进不去都记入冲突，最后统一整批拒绝。
         List<String> conflicts = new ArrayList<>();
+        for (DeadLetter d : selected) {
+            int len = d.payload() == null ? 0 : d.payload().length;
+            if (len > config.maxPayloadBytes()) {
+                conflicts.add("死信 " + d.deadLetterId() + " 的重放负载超长: "
+                        + len + " > " + config.maxPayloadBytes());
+            }
+            if (d.replayed()) {
+                // 筛选范围包含此前已重放（含被单条重放）的死信：整批拒绝，绝不跳过它处理其余条目。
+                conflicts.add("死信 " + d.deadLetterId() + " 已重放（ALREADY_REPLAYED），"
+                        + "整批拒绝；如只需重放其余条目请缩小筛选条件后重新提交");
+            }
+        }
         java.util.Set<String> idemSet = state.idempotencyKeys.get(topic);
         for (DeadLetter d : selected) {
-            if (idemSet.contains(replayIdempotencyKey(d.deadLetterId()))) {
+            if (!d.replayed() && idemSet.contains(replayIdempotencyKey(d.deadLetterId()))) {
                 conflicts.add("死信 " + d.deadLetterId() + " 的重放幂等键已存在（重复重放）");
             }
         }
@@ -570,7 +587,8 @@ public class ReliableMessageQueue implements AutoCloseable {
             throw new com.github.h3yow.reliablemessagequeuejava.queue.exception.BatchReplayRejectedException(
                     "批量重放被整体拒绝（一条都不会生效，已有数据不变）: "
                             + String.join("; ", conflicts)
-                            + "。处理后可用完全相同的筛选条件重新提交。");
+                            + "。容量等临时性问题解决后可用完全相同的筛选条件重新提交；"
+                            + "因已重放记录被拒时请缩小筛选条件后再提交。");
         }
 
         // 4) 全部预检通过后，按确定顺序一次性追加，整批只落盘一次
@@ -663,8 +681,50 @@ public class ReliableMessageQueue implements AutoCloseable {
             throw new InvalidTopicException(
                     "分区越界: partition=" + partition + " partitionCount=" + config.partitionCount());
         }
-        long now = System.currentTimeMillis();
         GroupState gs = state.groups.get(groupKey(group, topic));
+        return computeBlocker(group, gs, topic, partition, System.currentTimeMillis());
+    }
+
+    /**
+     * 只给主题和分区（不指定消费组）时的卡点查询：分别返回该分区上<em>每个被卡住的消费组</em>
+     * 各自的卡点信息。不同消费组各自维护位点/租约/退避，同一分区可能在不同消费组上分别卡住。
+     *
+     * <p>没有任何消费组被卡住（包括该分区尚无消费组的情况）时 {@code blocked=false} 且
+     * {@code groups} 为空列表，明确表示“没有卡点”。结果按消费组名排序，多次调用结果确定。
+     * 该查询为只读操作，不会回收租约或改变任何状态。
+     */
+    public synchronized PartitionBlockers getPartitionBlockers(String topic, int partition) {
+        TopicConfig config = requireTopic(topic);
+        if (partition < 0 || partition >= config.partitionCount()) {
+            throw new InvalidTopicException(
+                    "分区越界: partition=" + partition + " partitionCount=" + config.partitionCount());
+        }
+        long now = System.currentTimeMillis();
+        List<PartitionBlocker> blockers = new ArrayList<>();
+        for (GroupState gs : state.groups.values()) {
+            if (!gs.topic.equals(topic)) {
+                continue;
+            }
+            PartitionBlocker b = computeBlocker(gs.group, gs, topic, partition, now);
+            if (b.blocked()) {
+                blockers.add(b);
+            }
+        }
+        blockers.sort(Comparator.comparing(PartitionBlocker::group));
+        boolean any = !blockers.isEmpty();
+        if (any) {
+            log.info("分区卡点查询（全部消费组） topic={} partition={} blockedGroups={}",
+                    topic, partition, blockers.stream().map(PartitionBlocker::group).toList());
+        }
+        return new PartitionBlockers(topic, partition, any, List.copyOf(blockers));
+    }
+
+    /**
+     * 计算单个消费组在某分区的卡点（{@code gs} 为 null 表示该消费组尚未在该主题建立消费）。
+     * 判定口径与 {@code poll} 完全一致，且为只读。
+     */
+    private PartitionBlocker computeBlocker(String group, GroupState gs, String topic,
+                                            int partition, long now) {
         long committed = gs == null ? -1L : gs.committedOffsets.getOrDefault(partition, -1L);
 
         // 找队首：严格按位点找第一条未解决且未进死信的消息（位点在该分区内连续）。
@@ -716,6 +776,17 @@ public class ReliableMessageQueue implements AutoCloseable {
         return new PartitionBlocker(topic, group, partition, true, blockerState,
                 head.id(), head.offset(), head.seq(), head.partitionKey(),
                 attempts, lastError, nextDeliverableAt, leaseExpiresAt, head.publishedAt());
+    }
+
+    /** 主题内现存消息总数（只读，便于测试与本地诊断观察“消息数量不变”等保证）。 */
+    synchronized int messageCount(String topic) {
+        int count = 0;
+        for (StoredMessage m : state.messages) {
+            if (m.topic().equals(topic)) {
+                count++;
+            }
+        }
+        return count;
     }
 
     // ---------------- 租约回收 ----------------

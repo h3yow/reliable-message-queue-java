@@ -6,6 +6,7 @@ import com.github.h3yow.reliablemessagequeuejava.queue.model.DeadLetter;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.DeadLetterFilter;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.Delivery;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.PartitionBlocker;
+import com.github.h3yow.reliablemessagequeuejava.queue.model.PartitionBlockers;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.PublishResult;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.ReplayResult;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.TopicConfig;
@@ -145,11 +146,22 @@ public class QueueController {
         return queue.replayDeadLetters(new DeadLetterFilter(topic, g, p, from, to));
     }
 
+    /**
+     * 分区卡点查询。{@code group} 可选：
+     * <ul>
+     *   <li>带 group：返回该消费组的卡点视图 {@link PartitionBlocker}；</li>
+     *   <li>不带 group：返回该分区上每个被卡住的消费组各自的卡点 {@link PartitionBlockers}，
+     *       没有任何卡点时 blocked=false、groups=[]。</li>
+     * </ul>
+     */
     @GetMapping("/topics/{topic}/partitions/{partition}/blocker")
-    public PartitionBlocker partitionBlocker(@PathVariable String topic,
-                                             @PathVariable int partition,
-                                             @RequestParam String group) {
-        return queue.getPartitionBlocker(group, topic, partition);
+    public Object partitionBlocker(@PathVariable String topic,
+                                   @PathVariable int partition,
+                                   @RequestParam(required = false) String group) {
+        if (group != null && !group.isBlank()) {
+            return queue.getPartitionBlocker(group, topic, partition);
+        }
+        return queue.getPartitionBlockers(topic, partition);
     }
 
     private static Delivery toDelivery(String topic, String group, Map<String, Object> body) {
