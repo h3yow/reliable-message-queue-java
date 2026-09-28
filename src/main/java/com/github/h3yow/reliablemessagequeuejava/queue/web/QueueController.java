@@ -5,7 +5,6 @@ import com.github.h3yow.reliablemessagequeuejava.queue.model.BatchReplayResult;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.DeadLetter;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.DeadLetterFilter;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.Delivery;
-import com.github.h3yow.reliablemessagequeuejava.queue.model.PartitionBlocker;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.PublishResult;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.ReplayResult;
 import com.github.h3yow.reliablemessagequeuejava.queue.model.TopicConfig;
@@ -146,9 +145,13 @@ public class QueueController {
     }
 
     @GetMapping("/topics/{topic}/partitions/{partition}/blocker")
-    public PartitionBlocker partitionBlocker(@PathVariable String topic,
-                                             @PathVariable int partition,
-                                             @RequestParam String group) {
+    public Object partitionBlocker(@PathVariable String topic,
+                                   @PathVariable int partition,
+                                   @RequestParam(required = false) String group) {
+        // 只给主题和分区（不传 group）时，返回该分区所有消费组各自的卡点聚合视图。
+        if (group == null || group.isBlank()) {
+            return queue.getPartitionBlockers(null, topic, partition);
+        }
         return queue.getPartitionBlocker(group, topic, partition);
     }
 
